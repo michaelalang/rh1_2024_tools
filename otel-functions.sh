@@ -68,6 +68,7 @@ function ocurl() {
 
 function curl() {
   traceparent
+  echo ${TRACEPARENT}
   /usr/bin/curl -H "traceparent: ${TRACEPARENT}" "$@" 
 }
 
