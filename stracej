@@ -1,0 +1,279 @@
+#!/usr/bin/python
+
+import sys
+import json
+import re
+import os
+from opentelemetry import context, trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+    OTLPSpanExporter as grpcOTLPSpanExporter,
+)
+from opentelemetry.sdk.resources import (
+    SERVICE_NAME,
+    SERVICE_NAMESPACE,
+    SERVICE_VERSION,
+    Resource,
+)
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor,
+)
+from opentelemetry.trace import NonRecordingSpan, Span, SpanContext, TraceFlags
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.trace.status import StatusCode
+
+exporter = grpcOTLPSpanExporter(
+    endpoint=os.environ.get("OTEL_GRPC_ENDPOINT", "http://localhost:4317"),
+    insecure=True,
+)
+
+strace_syscall = re.compile(
+    r"^(?P<syscall>\w+)\((?P<params>.*?\))\s+=\s(?P<result>.*)$"
+)
+strace_signal = re.compile(
+    r"^\-{3}\s(?P<signal>\w+)\s\{si_signo=(?P<sgino>\w+), si_code=(?P<sicode>\w+), si_pid=(?P<sipid>\d+), si_uid=(?P<siuid>\d+)\}\s\-{3}$"
+)
+strace_kill = re.compile(r"^\+{3}\skilled\sby\s(?P<signal>\w+)\s\+{3}$")
+strace_exit = re.compile(r"^\+{3}\sexited with\s(?P<exit_code>\d+)\s\+{3}$")
+strace_dict = re.compile(r"(?P<key>\w+)=(?P<value>.*?),")
+
+def parse_dict(content):
+    cdict = {}
+    try:
+        for c in map(lambda x: x.groupdict(), strace_dict.finditer(content)):
+            if c['key'] == 'st_size':
+                cdict[c['key']] = int(c['value'])
+            else:
+                cdict[c['key']] = c['value']
+        if cdict == {}:
+            return content
+    except Exception as pcerr:
+        print(f"[PCERR] {pcerr}")
+        return content
+    return cdict
+
+def parse_with_date(line):
+    try:
+        pid, date = map(float, line.split(" ")[0:2])
+        line = " ".join(line.split(" ", 2)[2:])
+    except:
+        date = float(line.split(" ")[0])
+        line = " ".join(line.split(" ", 1)[1:])
+    return parse2json(line, date)
+
+
+def parse2json(line, date=None):
+    mo = False
+    for regxs in (strace_syscall, strace_signal, strace_kill, strace_exit):
+        try:
+            mo = regxs.match(line)
+        except TypeError:
+            print(f"line = -{line}-")
+        if not mo:
+            continue
+        content = mo.groupdict()
+        if date == None:
+            content["timestamp"] = time.time()
+        else:
+            content["timestamp"] = date
+        if content.get("params", False):
+            cont = parse_dict(content["params"][:-1])
+            if isinstance(cont, dict):
+                content.update(cont)
+            else:
+                content["params"] = cont[:-1].split(',')
+        if content.get('result', False):
+            try:
+                content['result'] = int(content.get('result'))
+            except ValueError:
+                try:    
+                    res = content.get('result')
+                    content['result'] = int(res.split(' ')[0])
+                    content['result_text'] = " ".join(res.split(' ')[1:])
+                except ValueError:
+                    content['result_text'] = content['result']
+                    content['result'] = 0
+        if content.get("exit_code", False):
+            content["exit_code"] = int(content.get("exit_code"))
+        return content
+    raise ValueError()
+
+
+parseformat = parse2json
+
+
+def parseline(line, pformat=False):
+    if pformat == False:
+        try:
+            rsp = parse_with_date(line)
+            pformat = parse_with_date
+        except ValueError:
+            try:
+                rsp = parse2json(line)
+                pformat = parse2json
+            except:
+                raise ValueError(f"canot parse {line}")
+        return (rsp, pformat)
+    else:
+        return pformat(line)
+
+def result_to_status(line):
+    #print(f"[RESULT] = {line.get('result')} {line.get('result_text')}")
+    if any([line.get('result', 0) >= 0,
+            'EINPROGRESS' in line.get('result_text', '')]):
+            return StatusCode.OK
+    else:
+            return StatusCode.ERROR
+
+
+execve, pformat = parseline(sys.stdin.readline(), False)
+
+SRV_NAME = os.environ.get("OTEL_SERVICE_NAME", execve.get("params", [os.environ.get("HOSTNAME")])[0])
+NAMESPACE = os.environ.get("OTEL_NAMESPACE", "strace")
+VERSION = os.environ.get("OTEL_APP_VERSION", "v1.0.0")
+provider = TracerProvider(
+    resource=Resource.create(
+        {
+            SERVICE_NAME: SRV_NAME,
+            SERVICE_NAMESPACE: NAMESPACE,
+            SERVICE_VERSION: VERSION,
+        }
+    )
+)
+
+processor = BatchSpanProcessor(exporter)
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+
+spacer = ""
+tracer = trace.get_tracer(__name__)
+ctx = context.get_current()
+childs = []
+events = []
+
+def childspan(ctx, lines):
+    global events
+    line = lines.pop(0)
+    ctx = context.get_current()
+    with tracer.start_as_current_span(
+                        line.get("syscall", "signal"),
+                        context=ctx,
+                        attributes={
+                            SERVICE_NAMESPACE: NAMESPACE,
+                            SERVICE_VERSION: VERSION,
+                        },
+                    ) as syscallspan1:
+        for k in line:
+            syscallspan1.set_attribute(k, line[k])
+        syscallspan1.set_status(result_to_status(line))
+        #print(f"{spacer}{line}")
+        ctx = context.get_current()
+        for line2 in lines:
+            with tracer.start_as_current_span(
+                        line2.get("syscall", "signal"),
+                        context=ctx,
+                        attributes={
+                            SERVICE_NAMESPACE: NAMESPACE,
+                            SERVICE_VERSION: VERSION,
+                        },
+                    ) as syscallspan2:
+                    for k in line2:
+                        syscallspan2.set_attribute(k, line2[k])
+                        syscallspan2.set_status(result_to_status(line2))
+                        for event in events:
+                            syscallspan2.add_event(
+                                event.get("syscall"),
+                                attributes=event,
+                                )
+    events = []
+
+                    #print(f"{spacer}{line}")
+
+
+with tracer.start_as_current_span(
+    "strace",
+    context=ctx,
+    attributes={SERVICE_NAMESPACE: NAMESPACE, SERVICE_VERSION: VERSION},
+) as span:
+    childspan(ctx, [execve])
+    with sys.stdin as input:
+        for line in input.readlines():
+            if line in ("", [], None):
+                break
+            try:
+                if not pformat:
+                    line, pformat = parseline(line, False)
+                    print(line)
+                else:
+                    line = parseline(line, pformat)
+                if any([line.get('signal', False),
+                        line.get('exit_code', False),
+                        ]):
+                    childspan(ctx, [line])
+                    continue
+                if line.get("syscall", "brk") in [
+                        "read",
+                        "write",
+                        ]:
+                    events.append(line)
+                    continue
+                if not line.get("syscall", "brk") in [
+                        "execve",
+                        "access",
+                        "openat",
+                        "fstat",
+                        "close",
+                        "prlimit64",
+                        "readlink",
+                        "sysinfo",
+                        "close",
+                        "geteuid",
+                        "getuid",
+                        "getegid",
+                        "getgid",
+                        "socket",
+                        "setsockopt",
+                        "connect",
+                        "getsockopt",
+                        "getsockname",
+                        "getpeername",
+                        "setsockopt",
+                        "statx",
+                    ]:
+                        # ignore
+                        continue
+                elif line.get("syscall", "brl") in ("openat", "socket", "connect"):
+                        #print(f"Append: {line}")
+                        childs.append(line)
+                        continue
+                elif line.get("syscall", "brk") == "close":
+                        try:
+                            spacer = spacer[:-2]
+                            ctx = context.get_current()
+                            childspan(ctx, childs)
+                            childspan(ctx, [line])
+                            childs = []
+                        except:
+                            spacer = ""
+                        continue
+                elif line.get("syscall", "brk") == "exit_group":
+                        spacer = ""
+                        ctx = context.get_current()
+                        if childs != []:
+                            childspan(ctx, childs)
+                        childspan(ctx, [line])
+                        childs = []
+                        continue
+                if childs != []:
+                        childs.append(line)
+                        continue
+                childspan(ctx, [line])
+            except Exception as stracerr:
+                #print(f"[STRACEERR] {stracerr} {line}")
+                pass
+    if line.get('exit_code', False):
+        if line.get('exit_code', 0) > 0:
+            span.set_status(StatusCode.ERROR)
+        else:
+            span.set_status(StatusCode.OK)
+    print(ctx)

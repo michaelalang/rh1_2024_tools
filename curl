@@ -1,0 +1,5 @@
+#!/bin/bash
+
+source /etc/profile.d/otel-functions.sh
+traceparent
+/usr/bin/curl -H "traceparent: ${TRACEPARENT}" "$@"

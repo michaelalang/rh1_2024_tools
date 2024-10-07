@@ -1,0 +1,8 @@
+#!/bin/bash
+
+source /etc/profile.d/otel-functions.sh
+traceparent
+export TRACEPARENT=${TRACEPARENT}
+/usr/bin/strace -ttt -f /usr/bin/curl -H "traceparent: ${TRACEPARENT}" "$@" 2>&1 >/dev/null | /usr/local/bin/.strace
+unset TRACEPARENT
+
