@@ -13,7 +13,7 @@ function startspan() {
   otel-cli span background \
    --service ${OTEL_SPAN_SERVICE:-curl} \
    --name "${OTEL_SPAN_NAME:-curl}" \
-   --protocol grpc \
+   --protocol ${OTEL_PROTOCOL:-grpc} \
    --attrs="os.hostname=${HOSTNAME},os.pwd=$(pwd),os.uid=$(id -u),os.group=$(id -g)" \
    --timeout 300 \
    --sockdir $sockdir & >/dev/null 2>&1 
@@ -36,7 +36,7 @@ function tracecmd() {
   end=$(date --iso-8601=ns)
   otel-cli span \
     --verbose \
-    --protocol grpc \
+    --protocol ${OTEL_PROTOCOL:-grpc} \
     --attrs="os.hostname=${HOSTNAME},os.pwd=$(pwd),os.uid=$(id -u),os.group=$(id -g),os.cmd=${ocmd}" \
     --service "${OTEL_SPAN_SERVICE:-$0}" \
     --name "${OTEL_SPAN_NAME:-${ocmd[0]}}" \
@@ -59,7 +59,7 @@ function tracespan() {
 }
 
 function ocurl() {
-  otel-cli exec --protocol grpc \
+  otel-cli exec --protocol ${OTEL_PROTOCOL:-grpc} \
     --attrs="os.hostname=${HOSTNAME},os.pwd=$(pwd),os.uid=$(id -u),os.group=$(id -g)" \
     --service ${OTEL_SERVICE:-curl} \
     --name "${OTEL_NAME:-curl}" -- \
@@ -74,7 +74,7 @@ function curl() {
 
 # Usage: tracing::init [endpoint; default localhost:4317]
 function tracing::init() {
-  export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-https://tempo-grpc.example.com:443}"
+  export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
 }
 
 # Usage: tracing::auto::init [endpoint; default localhost:4317]
@@ -117,7 +117,7 @@ function tracing::auto::init() {
       unset oldparents[-1]
 
       TRACEPARENT=$nextparent otel-cli span \
-        --protocol grpc \
+        --protocol ${OTEL_PROTOCOL:-grpc} \
         --service "${BASH_SOURCE[-1]}" \
         --name "${FUNCNAME[1]}" \
         --attrs="os.hostname=${HOSTNAME},os.pwd=$(pwd),os.uid=$(id -u),os.group=$(id -g)"  \
@@ -151,7 +151,7 @@ function tracing::run() {
   # Now report this span. We override the IDs to the ones we set before.
   # TODO: support attributes
   otel-cli span \
-    --protocol grpc \
+    --protocol ${OTEL_PROTOCOL:-grpc} \
     --service "${BASH_SOURCE[-1]}" \
     --name "$1" \
     --attrs="os.hostname=${HOSTNAME},os.pwd=$(pwd),os.uid=$(id -u),os.group=$(id -g)"  \
